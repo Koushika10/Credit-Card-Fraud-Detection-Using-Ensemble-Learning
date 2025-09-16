@@ -1,0 +1,268 @@
+import sqlite3
+import contextlib
+import re
+import numpy as np
+import pickle
+from argon2 import PasswordHasher
+from argon2.exceptions import VerifyMismatchError
+from flask import (
+    Flask, render_template, 
+    request, session, redirect
+)
+import pandas as pd
+import matplotlib.pyplot as plt
+import io
+from email.mime.text import MIMEText
+import base64
+from twilio.rest import Client 
+import smtplib
+from create_database import setup_database
+from utils import login_required, set_session
+
+app = Flask(__name__)
+
+model = pickle.load(open('model.pkl', 'rb'))
+
+app.secret_key = 'xpSm7p5bgJY8rNoBjGWiz5yjxM-NEBlW6SIBI62OkLc='
+
+database = "users.db"
+setup_database(name=database)
+
+def send_email(prediction):
+    # Email configuration
+    sender_email = "elakiyanagaraj71@gmail.com"
+    receiver_email = "nathiyad22@gmail.com"
+    password = "fycyijbbfgkgmkfx"  # Use an app password if using Gmail with 2FA
+
+    # Create the email content
+    if prediction == 1:
+        subject = " Safety Alert"
+        body = f"Alert! The account not safe."
+    
+    else:
+        subject = "Safety Confirmation"
+        body = f"Good news! The account is safe."
+
+    # Create the email message
+    msg = MIMEText(body)
+    msg['Subject'] = subject
+    msg['From'] = sender_email
+    msg['To'] = receiver_email
+
+    try:
+        # Send the email
+        with smtplib.SMTP('smtp.gmail.com', 587) as server:  # Change to your SMTP server
+            server.starttls()
+            server.login(sender_email, password)
+            server.sendmail(sender_email, receiver_email, msg.as_string())
+        print("Email sent successfully.")
+    except Exception as e:
+        print(f"Failed to send email: {e}")
+
+def send_sms(prediction, to_phone_numbers):
+    # Twilio configuration
+    account_sid = 'ACdfe1a98ce64c1515a63d8b755c823e64'  # Replace with your Twilio account SID
+    auth_token = '16793185508d560c0acbfd71a40655d7'      # Replace with your Twilio auth token
+    from_phone = '+15856324784' # Replace with your Twilio phone number
+
+    # Create the SMS content
+    if prediction==1:
+        message_body = f"Alert! your account not safe"
+    else:
+        message_body = f"Good news! The account is safe."
+
+    # Create a Twilio client
+    client = Client(account_sid, auth_token)
+
+    for to_phone in to_phone_numbers:
+        try:
+            # Send the SMS
+            message = client.messages.create(
+                body=message_body,
+                from_=from_phone,
+                to=to_phone
+            )
+            print(f"SMS sent successfully to {to_phone}.")
+        except Exception as e:
+            print(f"Failed to send SMS to {to_phone}: {e}")
+
+@app.route('/')
+def first():
+    return render_template("index1.html")
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    session.permanent = False
+    return redirect('/login')
+
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'GET':
+        return render_template('login.html')
+
+    username = request.form.get('username')
+    password = request.form.get('password')
+    
+    query = 'select username, password, email from users where username = :username'
+
+    with contextlib.closing(sqlite3.connect(database)) as conn:
+        with conn:
+            account = conn.execute(query, {'username': username}).fetchone()
+
+    if not account: 
+        return render_template('login.html', error='Username does not exist')
+
+    try:
+        ph = PasswordHasher()
+        ph.verify(account[1], password)
+    except VerifyMismatchError:
+        return render_template('login.html', error='Incorrect password')
+
+    if ph.check_needs_rehash(account[1]):
+        query = 'update set password = :password where username = :username'
+        params = {'password': ph.hash(password), 'username': account[0]}
+        with contextlib.closing(sqlite3.connect(database)) as conn:
+            with conn:
+                conn.execute(query, params)
+
+    set_session(
+        username=account[0], 
+        email=account[2], 
+        remember_me='remember-me' in request.form
+    )
+    
+    return redirect('/predict1')
+
+
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    if request.method == 'GET':
+        return render_template('register.html')
+    
+    password = request.form.get('password')
+    confirm_password = request.form.get('confirm-password')
+    username = request.form.get('username')
+    email = request.form.get('email')
+
+    if len(password) < 8:
+        return render_template('register.html', error='Your password must be 8 or more characters')
+    if password != confirm_password:
+        return render_template('register.html', error='Passwords do not match')
+    if not re.match(r'^[a-zA-Z0-9]+$', username):
+        return render_template('register.html', error='Username must only be letters and numbers')
+    if not 3 < len(username) < 26:
+        return render_template('register.html', error='Username must be between 4 and 25 characters')
+
+    query = 'select username from users where username = :username;'
+    with contextlib.closing(sqlite3.connect(database)) as conn:
+        with conn:
+            result = conn.execute(query, {'username': username}).fetchone()
+    if result:
+        return render_template('register.html', error='Username already exists')
+
+    pw = PasswordHasher()
+    hashed_password = pw.hash(password)
+
+    query = 'insert into users(username, password, email) values (:username, :password, :email);'
+    params = {
+        'username': username,
+        'password': hashed_password,
+        'email': email
+    }
+
+    with contextlib.closing(sqlite3.connect(database)) as conn:
+        with conn:
+            result = conn.execute(query, params)
+
+    set_session(username=username, email=email)
+    return render_template('register.html', success=True)
+
+
+
+@app.route('/graph')
+def graph():
+    return render_template("graph.html")
+
+@app.route('/feed back')
+def feed_back():
+    return render_template("feed back.html")
+
+@app.route('/predict1', methods=['GET'])
+def Home():
+    return render_template('index.html')
+
+@app.route('/predict', methods=['POST'])
+def predict():
+    try:
+        ID = request.form['ID']
+        LIMIT_BAL = float(request.form['LIMIT_BAL'])
+        PAY_1 = int(request.form['PAY_1'])
+        PAY_2 = int(request.form['PAY_2'])
+        PAY_3 = int(request.form['PAY_3'])
+        PAY_4 = int(request.form['PAY_4'])
+        PAY_5 = int(request.form['PAY_5'])
+        BILL_AMT1 = float(request.form['BILL_AMT1'])
+        BILL_AMT2 = float(request.form['BILL_AMT2'])
+        BILL_AMT3 = float(request.form['BILL_AMT3'])
+        BILL_AMT4 = float(request.form['BILL_AMT4'])
+        BILL_AMT5 = float(request.form['BILL_AMT5'])
+
+        input_data = pd.DataFrame({
+            'ID': [ID],
+            'LIMIT_BAL': [LIMIT_BAL],
+            'PAY_1': [PAY_1],
+            'PAY_2': [PAY_2],
+            'PAY_3': [PAY_3],
+            'PAY_4': [PAY_4],
+            'PAY_5': [PAY_5],
+            'BILL_AMT1': [BILL_AMT1],
+            'BILL_AMT2': [BILL_AMT2],
+            'BILL_AMT3': [BILL_AMT3],
+            'BILL_AMT4': [BILL_AMT4],
+            'BILL_AMT5': [BILL_AMT5]
+        })
+
+        # Predict probabilities
+        proba = model.predict_proba(input_data)[0]
+        confidence = np.max(proba)
+        prediction = np.argmax(proba)
+        result = "Fraudulent" if prediction == 1 else "Non-Fraudulent"
+        to_phone_numbers = [
+            '+919361397183',  # Replace with actual phone numbers
+            '+918754131719',
+            '+919025696865'
+              # Add more numbers as needed
+        ]
+        
+        # Call send_sms with the correct parameters
+        send_sms(prediction, to_phone_numbers)
+        send_email(prediction)
+        # Plot the graph
+        plt.figure(figsize=(4, 3))
+        plt.bar(['Non-Fraudulent', 'Fraudulent'], proba, color=['green', 'red'])
+        plt.ylim(0, 1)
+        plt.ylabel('Confidence')
+        plt.title('Prediction Confidence')
+        buf = io.BytesIO()
+        plt.tight_layout()
+        plt.savefig(buf, format='png')
+        buf.seek(0)
+        graph_url = base64.b64encode(buf.getvalue()).decode('utf-8')
+        buf.close()
+
+        return render_template(
+            'result.html',
+            result=result,
+            prediction=prediction,
+            confidence=round(confidence * 100, 2),
+            graph_url=graph_url
+        )
+
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+if __name__ == "__main__":
+    app.run(debug=True)
